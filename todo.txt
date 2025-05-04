@@ -1,0 +1,15 @@
+read config
+    - resolve vars until they are all resolved
+    - resolve workspaces and keybindings
+merge i3 config with workspace manager config
+    - if there are identical matches between the i3 workspace config
+    and the workspace switcher: ignore
+
+Have a menu for
+    - active workspaces
+    - Inacive workspaces
+    - All workspaces
+    - Named workspaces
+
+Outside of current scope:
+    - Have defaults for launching programs on open

@@ -1,0 +1,5 @@
+#!/bin/bash
+mkdir -p /etc/i3-workspace-switcher
+cp src/etc/i3-workspace-switcher/config /etc/i3-workspace-switcher
+cp src/bin/i3-get-workspaces /usr/local/bin
+cp src/bin/i3-workspace-switcher /usr/local/bin

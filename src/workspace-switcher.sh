@@ -1,8 +1,28 @@
 #!/bin/bash
+# i3 Workspace Switcher
+# Displays all workspaces defined in the configuration
+# Workspaces can be displayed on polybar, dmenu, rofi, and the cli
+# The polybar module can scroll with the mouse wheel or with buttons
+# Can change workspaces, and move the focused window to a different workspace
+# Author: Jason P
+# Last updated 2025-04-17
 
 MODULE_NAME="workspace_switcher"
 HOOK_INDEX=1
-LOCKFILE="/tmp/polybar-ipc-$MODULE_NAME.lock"
+LOCKFILE="/tmp/polybar-ipc-ws.lock"
+
+WS_CACHE_FILE="/tmp/polybar-workspaces.cache"
+INDEX_CACHE_FILE="/tmp/polybar-ws-index"
+TIMESTAMP_FILE="/tmp/i3-workspaces.timestamp"
+WORKSPACE_HASH_FILE="/tmp/i3-workspaces.hash"
+
+# Placeholder paths, adapt these
+CONFIG_PATH="${CONFIG_PATH:-$HOME/.config/i3/config}"
+# LOGFILE="${XDG_CACHE_HOME:-$HOME/.cache}/i3-workspace-switcher.log"
+LOGFILE="/tmp/i3-workspace-switcher.log"
+
+MAX_LOG_SIZE=1048576  # 1 MB
+NUM_WORKSPACES=10
 
 rofi_menu() {
   rofi -dmenu -p "$@"
@@ -10,14 +30,21 @@ rofi_menu() {
 dmenu_menu() {
   dmenu -i -p  "$@"
 }
+log() {
+  level="$1"; shift
+  if [ -f "$LOGFILE" ] && [ "$(stat -c%s "$LOGFILE")" -gt $MAX_LOG_SIZE ]; then
+    mv "$LOGFILE" "$LOGFILE.old"
+    : > "$LOGFILE"
+  fi
+  echo "[$(date '+%F %T')] [$level] $*" >> "$LOGFILE"
+}
 
 scroll() {
   direction="$1"
-  cache_file="/tmp/polybar-ws-index"
 
   # Load current index
-  if [[ -f $cache_file ]]; then
-      index=$(<"$cache_file")
+  if [[ -f $INDEX_CACHE_FILE ]]; then
+      index=$(<"$INDEX_CACHE_FILE")
   else
       index=0
   fi
@@ -34,25 +61,25 @@ scroll() {
     fi
   fi
   # Save new index
-  echo "$index" > "$cache_file"
+  echo "$index" > "$INDEX_CACHE_FILE"
 
 }
 workspace_bar() {
 
   current_index=0
-  cache_file="/tmp/polybar-ws-index"
 
   # Load saved index
-  if [[ -f $cache_file ]]; then
-      current_index=$(<"$cache_file")
+  if [[ -f $INDEX_CACHE_FILE ]]; then
+      current_index=$(<"$INDEX_CACHE_FILE")
   fi
+
+  export WORKSPACE_ARRAY
+  IFS=$'\n' read -r -d '' -a WORKSPACE_ARRAY <<< "$WORKSPACES"
 
   # Clamp index
   [[ $current_index -lt 0 ]] && current_index=0
-  max_index=$((${#WORKSPACE_ARRAY[@]} - 5))
+  max_index=$((${#WORKSPACE_ARRAY[@]} - NUM_WORKSPACES))
   [[ $current_index -gt $max_index ]] && current_index=$max_index
-
-  num_workspaces=10
 
   current=$(i3-msg -t get_workspaces | jq -r '.[] | select(.focused==true).name')
   echo -n "%{u#00ff00 +u}$(workspace_item "$current")%{u-} "
@@ -60,13 +87,13 @@ workspace_bar() {
   echo -n "     %{A1:workspace-switcher scroll=up:}➡️    %{A} "
   echo -n "%{A4:workspace-switcher scroll=up :}%{A5:workspace-switcher scroll=down :}"
 
-  for ((i = current_index; i < current_index + $num_workspaces && i < ${#WORKSPACE_ARRAY[@]}; i++)); do
+  for ((i = current_index; i < current_index + $NUM_WORKSPACES && i < ${#WORKSPACE_ARRAY[@]}; i++)); do
     ws="${WORKSPACE_ARRAY[i]}"
     item=$(workspace_item "$ws")
     if [[ "$ws" != "$current" ]]; then
       echo -n "$item "
     else
-      ((num_workspaces++))
+      ((NUM_WORKSPACES++))
     #   echo -n "%{u#00ff00 +u}$item%{u-} "
     fi
   done
@@ -90,15 +117,17 @@ find_workspace_config() {
   for path in "${valid_paths[@]}"; do
     file_content=$(<"$path")
     if [[ "$file_content" == "$config_from_i3" ]]; then
-      # echo "✅ i3 is using this config file: $path" >&2
+      log INFO "✅ i3 is using this config file: $path"
       export WORKSPACE_CONFIG="$path"
     fi
   done
   if [[ -z $WORKSPACE_CONFIG ]]; then
-      echo "❌ No config file on disk matches the one loaded in memory." >&2
-      echo "If you are using a config from a non-standard location, ensure" >&2
-      echo "you are using absolute paths for resolving includes in your i3-config." >&2
-      echo "Alternatively, pass the --config=/path/to/config if you are using includes." >&2
+      LOG WARNING <<EOF
+  ❌ No config file on disk matches the one loaded in memory.
+  If you are using a config from a non-standard location, ensure
+  you are using absolute paths for resolving includes in your i3-config.
+  Alternatively, pass the --config=/path/to/config if you are using includes.
+EOF
   fi
 }
 parse_workspace_lines() {
@@ -119,80 +148,96 @@ parse_workspace_lines() {
     fi
   done <<< "$workspace_lines"
 }
-# resolve_includes() {
-#   local input="$1"
-#   local base_dir="$2"
-#   local output=""
+resolve_includes() {
+  local input="$1"
+  local base_dir="$2"
+  local output=""
 
-#   while IFS= read -r line; do
-#     if [[ "$line" =~ ^include[[:space:]]+(.+) ]]; then
-#       include_path=$(eval echo "${BASH_REMATCH[1]}")
-#       # Resolve relative paths against the base directory
-#       if [[ "$include_path" != /* ]]; then
-#         include_path="$base_dir/$include_path"
-#       fi
-#       if [[ -f "$include_path" ]]; then
-#         included_content=$(<"$include_path")
-#         included_base_dir=$(dirname "$include_path")
-#         included_resolved=$(resolve_includes "$included_content" "$included_base_dir")
-#         output+="$included_resolved"$'\n'
-#       else
-#         echo "Warning: included file '$include_path' not found." >&2
-#       fi
-#     else
-#       output+="$line"$'\n'
-#     fi
-#   done <<< "$input"
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^include[[:space:]]+(.+) ]]; then
+      include_path=$(eval echo "${BASH_REMATCH[1]}")
+      # Resolve relative paths against the base directory
+      if [[ "$include_path" != /* ]]; then
+        include_path="$base_dir/$include_path"
+      fi
+      if [[ -f "$include_path" ]]; then
+        mtime=$(stat -c %Y "$include_path")
+        echo "$include_path:$mtime" >> "$TIMESTAMP_FILE"
+        included_content=$(<"$include_path")
+        included_base_dir=$(dirname "$include_path")
+        included_resolved=$(resolve_includes "$included_content" "$included_base_dir")
+        output+="$included_resolved"$'\n'
+      else
+        log WARNING "included file '$include_path' not found."
+      fi
+    else
+      output+="$line"$'\n'
+    fi
+  done <<< "$input"
 
-#   echo "$output"
-# }
-# get_workspaces() {
-#     local cache_file="/tmp/i3-workspaces.cache"
-#   local timestamp_file="/tmp/i3-config.timestamp"
+  echo "$output"
+}
+get_workspaces() {
+  # Use cached if valid
+  if [[ -f "$WS_CACHE_FILE" && -f "$TIMESTAMP_FILE" ]]; then
+    valid_cache=true
+    while IFS= read -r line; do
+      file=$(cut -d':' -f1 <<< "$line")
+      old_mtime=$(cut -d':' -f2 <<< "$line")
+      new_mtime=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+      [[ "$old_mtime" != "$new_mtime" ]] && valid_cache=false
+    done < "$TIMESTAMP_FILE"
+
+    $valid_cache && cat "$WS_CACHE_FILE" && return
+  fi
+
+  # Build config and timestamp
+  log INFO "Rebuilding workspace config cache..."
+  : > "$TIMESTAMP_FILE"
   
-#   # Normalize and remove empty/null paths
-#   valid_paths=()
-#   [[ -n "$CONFIG_PATH" && -f "$CONFIG_PATH" ]] && valid_paths+=("$CONFIG_PATH")
-#   for path in "${POSSIBLE_PATHS[@]}"; do
-#     [[ -n "$path" && -f "$path" ]] && valid_paths+=("$path")
-#   done
+  # Normalize and remove empty/null paths
+  valid_paths=()
+  [[  -f "$CONFIG_PATH" ]] && valid_paths+=("$CONFIG_PATH")
+  for path in "${POSSIBLE_PATHS[@]}"; do
+    [[ -n "$path" && -f "$path" ]] && valid_paths+=("$path")
+  done
 
-#   find_workspace_config
+  find_workspace_config
 
-#   # Get the config directory
-#   base_dir=$(dirname "$WORKSPACE_CONFIG")
-#   # Flatten config
-#   flattened_config=$(resolve_includes "$config_from_i3" "$base_dir")
+  # Get the config directory
+  base_dir=$(dirname "$WORKSPACE_CONFIG")
+  # Flatten config
+  flattened_config=$(resolve_includes "$config_from_i3" "$base_dir")
 
-#   # Extract variable definitions
-#   declare -A vars
-#   while read -r line; do
-#     var_name=$(echo "$line" | awk '{print $2}')
-#     var_value=$(echo "$line" | cut -d' ' -f3-)
-#     vars["$var_name"]="$var_value"
-#   done < <(echo "$flattened_config" | grep -E '^set \$[A-Za-z_][A-Za-z0-9_]* .+')
+  # Extract variable definitions
+  declare -A vars
+  while read -r line; do
+    var_name=$(echo "$line" | awk '{print $2}')
+    var_value=$(echo "$line" | cut -d' ' -f3-)
+    vars["$var_name"]="$var_value"
+  done < <(echo "$flattened_config" | grep -E '^set \$[A-Za-z_][A-Za-z0-9_]* .+')
 
-#   # Find workspace lines using variables
-#   workspace_lines=$(echo "$flattened_config" | grep -E '^workspace \$[A-Za-z_][A-Za-z0-9_]* output \$[A-Za-z_][A-Za-z0-9_]*')
+  # Find workspace lines using variables
+  workspace_lines=$(echo "$flattened_config" | grep -E '^workspace \$[A-Za-z_][A-Za-z0-9_]* output \$[A-Za-z_][A-Za-z0-9_]*')
 
-#   workspaces_names=$(echo "$(parse_workspace_lines "$workspace_lines")" | awk '{print $2}' | sed 's/^"//; s/"$//')
-#   echo "$workspaces_names"
-# }
+  workspace_names=$(echo "$(parse_workspace_lines "$workspace_lines")" | awk '{print $2}' | sed 's/^"//; s/"$//')
+  echo "$workspace_names" | tee "$WS_CACHE_FILE"
+}
 
 get_menu_option() {
   label="$2"
   if [[ -z $MENU_TYPE ]]; then
     if [[ -n $alt_cmd ]]; then
       MENU_TYPE="$alt_cmd"
-      echo "⚠️ Using fallback menu type: $MENU_TYPE" >&2
+      log NOTICE "⚠️ Using fallback menu type: $MENU_TYPE"
     else
-      echo "❌ No menu type provided, and no fallback available." >&2
+      log ERROR "❌ No menu type provided, and no fallback available."
       exit 1
     fi
   fi
 
   if ! command -v ${MENU_TYPE%%_*} &>/dev/null; then
-    echo "❌ Menu command '${MENU_TYPE%%_*}' not found on system." >&2
+    log ERROR "❌ Menu command '${MENU_TYPE%%_*}' not found on system."
     exit 1
   fi
   echo -e "$WORKSPACES" | $MENU_TYPE "$label"
@@ -202,10 +247,10 @@ get_selected_workspace() {
   # Get selected workspace
   selected_workspace=$(get_menu_option "$WORKSPACES" "$label")
   if [[ -z "$selected_workspace" ]]; then
-    echo "No workspace selected" >&2
+    log INFO "No workspace selected"
     exit 1
   fi
-  echo "Selected workspace: $selected_workspace" >&2
+  log INFO "Selected workspace: $selected_workspace"
   export SELECTED_WORKSPACE=$selected_workspace
 }
 switch_workspace() {
@@ -218,7 +263,7 @@ switch_workspace() {
 
   # Switch to the workspace
   if [[ -z "$workspace_number" ]]; then
-    echo "No workspace number provided, instead received: $SELECTED_WORKSPACE" >&2
+    log ERROR "No workspace number provided, instead received: $SELECTED_WORKSPACE"
     exit 1
   fi
   if [[ -z "$workspace_name" ]]; then
@@ -226,16 +271,16 @@ switch_workspace() {
   else
     label="$workspace_number:\"$workspace_name\""
   fi
-  echo "Switching to workspace: $label" >&2
+  log INFO "Switching to workspace: $label"
   i3-msg workspace "$label"
 }
 move_window() {
     # Get the focused window's ID in i3
     focused_window_id=$(i3-msg -t get_tree | jq '.. | select(.focused? == true) | .id')
-    echo "Moving window id: $focused_window_id" >&2
+    log INFO "Moving window id: $focused_window_id"
 
     selected_window_num=$(i3-msg -t get_tree | jq --argjson id "$focused_window_id" 'recurse(.nodes[]?, .floating_nodes[]?) | select(.id == $id) | .window')
-    echo "With window num: $selected_window_num" >&2
+    log INFO "With window num: $selected_window_num"
 
     # Focus the selected workspace and move the focused window to it
     i3-msg [id=$selected_window_num] move window to workspace "$SELECTED_WORKSPACE"
@@ -251,10 +296,10 @@ cleanup() {
 start_ipc_listener() {
   # Only one listener should be running
   if [ -e "$LOCKFILE" ] && kill -0 "$(cat "$LOCKFILE")" 2>/dev/null; then
-    echo "Already running"
+    echo "Already running" >&2
     return  # Already running
   fi
-  echo "Starting background process for workspace-switcher"
+  log INFO "Starting background process for workspace-switcher"
 
   # Save current PID so we know listener is running
   echo $$ > "$LOCKFILE"
@@ -272,16 +317,37 @@ start_ipc_listener() {
 polybar_hook () {
   polybar-msg action "#$MODULE_NAME.hook.$HOOK_INDEX"
 }
+
+run_if_workspace_changed() {
+  new_hash=$(get_workspace_hash)
+  old_hash=$(cat "$WORKSPACE_HASH_FILE" 2>/dev/null)
+
+  if [[ "$new_hash" != "$old_hash" ]]; then
+    log INFO "Workspace config changed, running polybar_hook..."
+    echo "$new_hash" > "$WORKSPACE_HASH_FILE"
+    polybar_hook
+  else
+    log INFO "No workspace config changes."
+  fi
+}
+
+is_polybar_running() {
+  pgrep -x polybar >/dev/null
+}
+get_workspace_hash() {
+  # get_workspaces | sha256sum | awk '{print $1}'
+  $WORKSPACES | sha256sum | awk '{print $1}'
+}
 main() {
   config=""
   ALT_CMD=""
   positional=()
   if [[ "$1" == "--launch" ]]; then
-      echo "test"
+      log INFO "Launching the workspace-switcher bar"
       polybar_hook
       exit 0
   elif [[ "$1" = "--startup" ]]; then
-    echo "Starting Workspace Switcher"
+    log INFO "Starting Workspace Switcher"
     start_ipc_listener
     return 0
   fi
@@ -328,8 +394,7 @@ main() {
   if [[ "$mode" = "scroll" ]]; then
     if [[ "$direction" = "up" || "$direction" = "down" ]]; then
       scroll "$direction"
-      echo "scrolled $direction"
-      echo "$@" >> /tmp/polybar-test
+      log INFO "scrolled $direction"
     fi
     exit 0
   fi
@@ -345,8 +410,6 @@ main() {
   # echo "Menu: $MENU_TYPE" >&2
   # echo "Alt: $ALT_CMD" >&2
   # echo "Command: $command" >&2
-
-
 
   # Possible config paths (in search order)
   POSSIBLE_PATHS=(
@@ -364,9 +427,6 @@ main() {
   export WORKSPACES=$(get_workspaces)
   read -ra WORKSPACE_ARRAY <<< "$WORKSPACES"
 
-  export WORKSPACE_ARRAY
-  IFS=$'\n' read -r -d '' -a WORKSPACE_ARRAY <<< "$WORKSPACES"
-
   case "$command" in
     --startup)
       start_ipc_listener
@@ -379,25 +439,25 @@ main() {
       # workspace_bar
       ;;
     bar)
-      # echo "Workspace Bar"
+      log INFO "Workspace Bar"
       workspace_bar
       ;;
     list)
-      echo "List workspaces" >&2
+      log INFO "List workspaces"
       echo "$WORKSPACES"
       ;;
     switch)
-      echo "Switch workspaces" >&2
+      log INFO "Switch workspaces"
       [[ -n "$SELECTED_WORKSPACE" ]] || get_selected_workspace "Go to workspace"
       switch_workspace
       ;;
     shift)
-      echo "Shift workspaces" >&2
+      log INFO "Shift workspaces"
       [[ -n "$SELECTED_WORKSPACE" ]] || get_selected_workspace "Shift to workspace"
       shift_workspace
       ;;
     move)
-      echo "Move Workspaces" >&2
+      log INFO "Move Workspaces"
       [[ -n "$SELECTED_WORKSPACE" ]] || get_selected_workspace "Move window to workspace"
       move_window
       ;;

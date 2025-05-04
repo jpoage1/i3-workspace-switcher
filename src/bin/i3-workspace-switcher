@@ -1,0 +1,38 @@
+#!/bin/bash
+
+# Check if the get-workspaces command exists in the current directory (pwd) first
+if [[ -x "$(pwd)/get-workspaces" ]]; then
+  # Found in the current directory
+  workspace_list=$(./get-workspaces)
+else
+  # Not found in the current directory, checking the system PATH
+  if ! command -v get-workspaces &> /dev/null; then
+    echo "get-workspaces not found in the current directory or system PATH."
+    exit 1
+  else
+    # get-workspaces found in system PATH
+    workspace_list=$(get-workspaces)
+  fi
+fi
+
+# Create a menu from the workspaces using dmenu
+selected_workspace=$(echo "$workspace_list" | dmenu -i -p "Select Workspace:")
+
+if [[ -z "$selected_workspace" ]]; then
+    echo "$selected_workspace"
+  echo "Usage: $0 <line_number (1-40)>"
+  exit 1
+fi
+
+workspace_number=$(echo "$selected_workspace" | awk '{print $1}')
+workspace_name=$(echo "$selected_workspace" | awk '{print $2}')
+
+# Sanity check
+if [[ -z "$workspace_number" ]]; then
+  echo "No workspace found for line $selected_line"
+  exit 1
+fi
+
+# Switch to the workspace
+i3-msg workspace "$workspace_number:\"$workspace_name\""
+

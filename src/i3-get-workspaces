@@ -1,0 +1,114 @@
+
+#!/bin/bash
+
+DEV_ROOT="./../"
+
+# Set the path for the workspace config
+WORKSPACE_SYSTEM_CONFIG="/etc/i3/config"
+WORKSPACE_USER_CONFIG="$HOME/.config/i3/config"
+
+
+
+# Silently try to source the files if they exist
+[[ -f "/etc/i3-workspace-switcher.conf" ]] && source "/etc/i3-workspace-switcher.conf"
+[[ -f "$HOME/.config/i3-workspace-switcher/config" ]] && source "$HOME/.config/i3-workspace-switcher/config"
+
+# Recursive function to read the config file and resolve includes
+read_config() {
+    echo "$1"
+  local config_file="$1"
+  
+  # Check if the file exists
+  if [[ ! -f "$config_file" ]]; then
+    # We don't need to print an error
+    # We can continue without a config
+    echo "???"
+    return 1
+  fi
+  
+  # Read the config file line by line
+  while IFS= read -r line; do
+    # If the line starts with 'include', resolve the include file
+
+    # Regular expression to capture the path inside quotes or after 'include' if no quotes are present
+    if [[ "$line" =~ ^include[[:space:]]+\"?([^\"]+)\"?$ ]]; then
+      include_file="${BASH_REMATCH[1]}"
+      
+      # Resolve relative paths to absolute paths
+      if [[ ! "$include_file" =~ ^/ ]]; then
+        include_file="$(dirname "$config_file")/$include_file"
+      fi
+      
+      # Recursively call read_config for the included file
+      echo "$(read_config "$include_file")"
+    else
+      # Print non-include lines as part of the configuration
+      echo "$line" | sed 's/#.*//'
+    fi
+  done < "$config_file"
+}
+
+# Load the i3 configuration file
+if [[ -n $WORKSPACE_CONFIG ]]; then
+    workspace_config=$(read_config "$WORKSPACE_CONFIG")
+elif [[ -f "$WORKSPACE_SYSTEM_CONFIG" || -f "$WORKSPACE_USER_CONFIG" ]]; then
+    workspace_config="$(read_config "$WORKSPACE_SYSTEM_CONFIG")$(echo -e '\n')$(read_config "$WORKSPACE_USER_CONFIG")"
+fi
+
+workspace_config=$workspace_config$(echo -e '\n')$(i3-msg -t get_workspaces | jq -r '.[] | .name')
+# If no config found,
+# we may find workspaces elsewhere,
+# lets continue
+
+# Extract all workspaces
+all_workspaces=$(echo "$workspace_config" | grep -oP '^workspace\s+\S+')
+echo "$all_workspaces"
+
+# workspaces=$(echo "$workspace_config" | grep -oP 'set \$ws[0-9]+ "[^"]+"|workspace \d+' )
+# echo "$workspace_config"
+# exit
+
+# # Extract workspace names from the config file
+# # echo "Workpsaces:"
+# all_config_workspaces=$(echo "$workspace_config" | grep -oP 'set \$ws[0-9]+')
+# #all_workspaces=$(grep -oP 'set \$ws[0-9]+' ~/.config/i3/generated-workspaces.conf)
+# unnamed_config_workspaces=$(grep -oP 'workspace [0-9]+' "$config_file" | sed 's/workspace //')
+
+# total_workspaces=$($all_workspaces | wc -l)
+# named_config_workspaces=$(echo "$workspace_config" | grep -oP 'set \$ws[0-9]+ [0-9]+:"[^"]*"' | sed 's/[:"]//g' | awk -F ' ' '{if ($3) print $2 " - " $3; else print $2}' | sed -E 's/\$ws[0-9]+ - ([0-9]+)([A-Za-z]+)/\1 \2/')
+# echo "$all_workspaces"
+exit
+unnamed_workspaces=$(i3-msg -t get_workspaces | jq -r '.[] | select(.name | test("^\\d+$")) | .name')
+unnamed_workspaces=$(for ws in "$unnamed_workspaces"; do echo "${ws} Active"; done)
+unnamed_workspaces=$(for ws in $unnamed_workspaces; do echo "${ws} Active"; done)
+workspaces="$named_workspaces
+$unnamed_workspaces"
+
+
+
+mapfile -t lines <<< "$workspaces"
+
+expected=1
+index=0
+new_list=()
+
+while [ $expected -le $total_workspaces ]; do
+    if [ $index -lt ${#lines[@]} ]; then
+        line="${lines[$index]}"
+        line_number=$(echo "$line" | awk '{print $1}')
+
+        if [[ "$line_number" =~ ^[0-9]+$ && "$line_number" -eq "$expected" ]]; then
+            output="$expected ${line#* }"
+            new_list+=("$output")
+            echo "$output"
+            ((index++))
+        else
+            new_list+=("$expected")
+            echo "$expected"
+        fi
+    else
+        new_list+=("$expected")
+        echo "$expected"
+    fi
+    ((expected++))
+done
