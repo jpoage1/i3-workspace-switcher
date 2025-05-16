@@ -1,0 +1,797 @@
+#!/bin/bash
+# i3 Workspace Switcher
+# Displays all workspaces defined in the configuration
+# Workspaces can be displayed on polybar, dmenu, rofi, and the cli
+# The polybar module can scroll with the mouse wheel or with buttons
+# Can change workspaces, and move the focused window to a different workspace
+# Author: Jason P
+# Last updated 2025-04-17
+
+FORCE_CACHE_REBUILD=false # Debugging only
+DEBUG=false
+
+MODULE_NAME="workspace_switcher"
+HOOK_INDEX=1
+
+WS_CACHE_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID}/polybar-workspaces"
+WORKSPACE_HASH_FILE="$WS_CACHE_DIR/i3-workspaces.hash"
+WORKSPACE_HASH_FILE_LOCK="$WS_CACHE_DIR/hash_lock.lock"
+
+WS_CACHE_FILE="$WS_CACHE_DIR/polybar-workspaces.cache"
+INDEX_CACHE_FILE="$WS_CACHE_DIR/polybar-ws-index"
+TIMESTAMP_FILE="$WS_CACHE_DIR/i3-workspaces.timestamp"
+
+SLIDE_INDEX_CACHE_FILE="$WS_CACHE_DIR/slide_index.cache"
+SLIDE_CACHE_FILE="$WS_CACHE_DIR/slide.cache"
+SLIDE_CACHE_FILE_LOCK="$WS_CACHE_DIR/slide.lock"
+
+# Lockfile for the workspace switcher
+IPC_LOCKFILE="$WS_CACHE_DIR/polybar-ipc-ws.lock"
+TIMESTAMP_FILE_LOCK="$WS_CACHE_DIR/timestamp.lock"
+LOGFILE_LOCK="$WS_CACHE_DIR/log.lock"
+WS_CACHE_FILE_LOCK="$WS_CACHE_DIR/cache.lock"
+SCROLL_INDEX_CACHE_FILE="$WS_CACHE_DIR/scroll.index.lock"
+SLIDE_INDEX_CACHE_FILE_LOCK="$WS_CACHE_DIR/slide.lock"
+
+# Placeholder paths, adapt these
+CONFIG_PATH="${CONFIG_PATH:-$HOME/.config/i3/config}"
+LOGFILE="${XDG_CACHE_HOME:-$HOME/.cache}/i3-workspace-switcher.log"
+#LOGFILE="$HOME/.local/share/i3-workspace-switcher/i3-workspaces-switcher.log" # Need persistent logs, dont use /dev/shm
+
+MAX_LOG_SIZE=1048576  # 1 MB
+NUM_WORKSPACES=10
+
+MIN_BAR_SIZE=500
+MAX_BAR_SIZE=1000
+
+export TAG="i3-workspace-switcher"
+
+rofi_menu() {
+  rofi -dmenu -p "$@"
+}
+dmenu_menu() {
+  dmenu -i -p  "$@"
+}
+rotate_log() {
+    # Check if the log file exceeds the maximum size
+    if [ "$(stat -c%s "$LOGFILE")" -gt "$MAX_LOG_SIZE" ]; then
+        local date=$(get_date)
+        # Archive the current log file by renaming it
+        mv "$LOGFILE" "$LOGFILE-$date.old"
+
+        # Clear the contents of the log file (truncate)
+        : > "$LOGFILE"
+
+        # Optionally, log the rotation event with the current date
+        log debug "$LOGFILE" "$LOGFILE_LOCK" "[$date] Log file rotated and archived"
+        write_file  "$LOGFILE" "$LOGFILE_LOCK" "[$date] Log file rotated and archived"
+        # echo "[$date] Log file rotated and archived" >> "$LOGFILE"
+
+    fi
+}
+
+# log() {
+#   local level="$1"; shift
+#   if [[ "$level" == "debug" && "$DEBUG" != true ]]; then
+#     return 0
+#   fi
+#   local date=$(get_date)
+#   if [ -w "$LOGFILE" ]; then
+#     rotate_log.sh "$date"
+#     log debug "$LOGFILE" "$LOGFILE_LOCK" "[$level] $*"
+#     write_file "$LOGFILE" "$LOGFILE_LOCK" "[$level] $*"
+
+#     # echo "[$date] [$level] $*" >> "$LOGFILE"
+#   else
+#     logger -p "user.$level" -t "i3-workspace-switcher" "[$level] $*"
+#   fi
+# }
+log() {
+  priority="$1"; shift
+  log.sh "$priority" "$*"
+}
+build_slide_cache() {
+  local index=0
+  local cache_content=""
+
+  if [[ ! -f "$WS_CACHE_FILE" ]]; then
+    log error "Workspace cache file not found: $WS_CACHE_FILE"
+    return 1
+  fi
+
+  while IFS= read -r line; do
+    name=$(echo "$line" | sed -E 's/^[0-9]+:"?([^"]+)"?$/\1/')
+    cache_content+="$index"$'\n'
+    index=$(( index + ${#name} + 1 )) # +1 for space
+  done < "$WS_CACHE_FILE"
+
+  write_file "$SLIDE_CACHE_FILE"  "$SLIDE_CACHE_FILE_LOCK" "$cache_content"
+
+  # Save hash of the workspace file
+  # cat "$cache_content" | awk '{print $1}' > "$SLIDE_CACHE_FILE"
+}
+generate_slide_cache() {
+  local index=0
+  local slide_indexes=()
+
+  # Create or truncate the slide cache file
+  : > "$SLIDE_CACHE_FILE"
+
+  while IFS= read -r line; do
+    # Strip quotes and numbers
+    name=$(echo "$line" | sed -E 's/^[0-9]+:"(.*)"$/\1/')
+    slide_indexes+=("$index")
+    index=$((index + ${#name} + 1)) # +1 for the space between names
+  done < "$WS_CACHE_FILE"
+
+  for idx in "${slide_indexes[@]}"; do
+    echo "$idx" >> "$SLIDE_CACHE_FILE"
+  done
+}
+
+validate_workspace_cache() {
+  if [[ ! -f "$WS_CACHE_FILE" || ! -f "$SLIDE_CACHE_FILE" || ! -f "$WORKSPACE_HASH_FILE" ]]; then
+    log notice "Hash file is missing..."
+    return 1
+  fi
+
+  local current_hash=$(get_workspace_hash)
+  local saved_hash=$(< "$WORKSPACE_HASH_FILE")
+  log debug "Current hash: $current_hash; Saved hash: $saved_hash"
+
+  if [[ "$current_hash" != "$saved_hash" ]]; then
+    log info "Workspace config changed, running polybar_hook..."
+    return 1
+  fi
+
+  log debug "No workspace config changes."
+
+  return 0
+}
+
+
+write_file() {
+  local file="$1"
+  local lockfile="$2"
+  shift 2
+  local contents="$@"
+  log debug "Lockfile: $lockfile"
+  safe-write.sh "$file" "$lockfile" "$@"
+  #   {
+  #   log debug "Writing to file: $file"
+  #   log debug "Contents: $contents"
+  #   flock -x 9
+  #   echo "$contents" > "$file"
+  # } 9>"$lockfile"
+}
+scroll() {
+  direction="$1"
+
+  # Load current index
+  if [[ -f $INDEX_CACHE_FILE ]]; then
+      index=$(<"$INDEX_CACHE_FILE")
+  else
+      index=0
+  fi
+  # Update index
+  count=${#WORKSPACE_ARRAY[@]}
+  if [[ "$direction" == "up" ]]; then
+    log debug "Scroll up"
+    ((index++))
+  elif [[ "$direction" == "down" ]]; then
+   if [ "$index" -lt 1 ]; then
+      log debug "Scroll down"
+      index=0
+    else
+      ((index--))
+    fi
+  fi
+  # Save new index
+  write_file "$INDEX_CACHE_FILE" "$SCROLL_INDEX_CACHE_FILE" "$index"
+  # echo "$index" > "$INDEX_CACHE_FILE"
+}
+scrollable_workspace_bar() {
+
+  current_index=0
+
+  # Load saved index
+  if [[ -f $INDEX_CACHE_FILE ]]; then
+      current_index=$(<"$INDEX_CACHE_FILE")
+  fi
+
+  export WORKSPACE_ARRAY
+  IFS=$'\n' read -r -d '' -a WORKSPACE_ARRAY <<< "$WORKSPACES"
+
+  # Clamp index
+  [[ $current_index -lt 0 ]] && current_index=0
+  max_index=$((${#WORKSPACE_ARRAY[@]} - NUM_WORKSPACES))
+  [[ $current_index -gt $max_index ]] && current_index=$max_index
+
+  current=$(i3-msg -t get_workspaces | jq -r '.[] | select(.focused==true).name')
+  echo -n "%{u#00ff00 +u}$(workspace_item "$current")%{u-} "
+  echo -n "%{A1:workspace-switcher scroll=down :}    ⬅️  %{A}"
+  echo -n "     %{A1:workspace-switcher scroll=up:}➡️    %{A} "
+  # Slide left or right
+  # echo -n "%{A4:workspace-switcher slide=left :}%{A5:workspace-switcher slide=right :}"
+  echo -n "%{A4:workspace-switcher scroll=up :}%{A5:workspace-switcher scroll=down :}"
+
+  log debug "${WORKSPACE_ARRAY[@]}"
+  for ((i = current_index; i < current_index + $NUM_WORKSPACES && i < ${#WORKSPACE_ARRAY[@]}; i++)); do
+    ws="${WORKSPACE_ARRAY[i]}"
+    item=$(workspace_item "$ws")
+    if [[ "$ws" != "$current" ]]; then
+      echo -n "$item "
+    else
+      ((NUM_WORKSPACES++))
+    #   echo -n "%{u#00ff00 +u}$item%{u-} "
+    fi
+  done
+  echo -n "%{A}%{A}"
+  echo -n "%{A1:workspace-switcher scroll=up:}    ➡️    %{A} "
+  echo
+}
+get_workspace_hash() {
+  # get_workspaces | sha256sum | awk '{print $1}'
+  workspace_hash=$(cat "$WS_CACHE_FILE" "$SLIDE_CACHE_FILE" | sha256sum | awk '{print $1}')
+  echo "$workspace_hash"
+}
+
+
+slidable_workspace_bar() {
+  local current_index=0
+  local current_slide_index=0
+
+  # Load saved index
+  if [[ -f $INDEX_CACHE_FILE ]]; then
+    current_index=$(<"$INDEX_CACHE_FILE")
+  fi
+
+  # Load beginning slide indexes
+  if [[ -f $SLIDE_CACHE_FILE ]]; then
+    mapfile -t SLIDE_INDEXES < "$SLIDE_CACHE_FILE"
+  fi
+
+  export WORKSPACE_ARRAY
+  IFS=$'\n' read -r -d '' -a WORKSPACE_ARRAY <<< "$WORKSPACES"
+
+  # Build the full output string
+  local output=""
+  for ws in "${WORKSPACE_ARRAY[@]}"; do
+    output+=$(workspace_item "$ws")
+    output+=" "
+  done
+  output="${output% }" # Remove trailing space
+
+  local output_length=${#output}
+  local slice_start=${SLIDE_INDEXES[$current_index]:-0}
+  local slice_end=$output_length
+
+  # Adjust slice_end based on desired window size
+  if (( output_length > MAX_BAR_SIZE )); then
+    slice_end=$((slice_start + MAX_BAR_SIZE))
+    [[ $slice_end -gt $output_length ]] && slice_end=$output_length
+  elif (( output_length < MIN_BAR_SIZE )); then
+    slice_end=$((slice_start + output_length))
+  fi
+
+  local visible_output="${output:slice_start:slice_end-slice_start}"
+
+  current=$(i3-msg -t get_workspaces | jq -r '.[] | select(.focused==true).name')
+
+  # Display the bar
+  echo -n "%{u#00ff00 +u}$(workspace_item "$current")%{u-} "
+  echo -n "%{A1:workspace-switcher scroll=down :}    ⬅️  %{A}"
+  echo -n "     %{A1:workspace-switcher scroll=up:}➡️    %{A} "
+  echo -n "%{A4:workspace-switcher scroll=up :}%{A5:workspace-switcher scroll=down :}"
+
+  echo -n "$visible_output"
+
+  echo -n "%{A}%{A}"
+  echo -n "%{A1:workspace-switcher scroll=up:}    ➡️    %{A} "
+  echo
+}
+
+
+workspace_item() {
+    ws="$1"
+    name="${ws#*:}"
+    number="${ws%%:*}"
+    name=${name//\"/}
+    [[ "$name" == "$number" ]] && label="${name:-$number}" || label="$number $name"
+    cmd_prefix="workspace-switcher ws=\"$number|$name\""
+    echo -n "%{A1:$cmd_prefix switch:}%{A3:$cmd_prefix move:}%{A2:$cmd_prefix shift:}$label%{A}%{A}%{A} "
+
+}
+workspace_item() {
+    ws="$1"
+    name="${ws#*:}"
+    number="${ws%%:*}"
+    name=${name//\"/}
+
+    # Set max length for workspace name
+    max_length=20  # Limit the name to 20 characters
+
+    # Truncate if the name is too long
+    if [[ ${#name} -gt $max_length ]]; then
+        name="${name:0:$max_length}..."
+    fi
+
+    # Set the label to be number + (possibly truncated) name
+    [[ "$name" == "$number" ]] && label="${name:-$number}" || label="$number $name"
+
+    cmd_prefix="workspace-switcher ws=\"$number|$name\""
+    echo -n "%{A1:$cmd_prefix switch:}%{A3:$cmd_prefix move:}%{A2:$cmd_prefix shift:}$label%{A}%{A}%{A} "
+}
+
+find_workspace_config() {
+  # Try to find a match
+  for path in "${valid_paths[@]}"; do
+    file_content=$(<"$path")
+    if [[ "$file_content" == "$config_from_i3" ]]; then
+      log debug "✅ i3 is using this config file: $path"
+      export WORKSPACE_CONFIG="$path"
+    fi
+  done
+  if [[ -z $WORKSPACE_CONFIG ]]; then
+      log warn <<EOF
+  ❌ No config file on disk matches the one loaded in memory.
+  If you are using a config from a non-standard location, ensure
+  you are using absolute paths for resolving includes in your i3-config.
+  Alternatively, pass the --config=/path/to/config if you are using includes.
+EOF
+  fi
+}
+parse_workspace_lines() {
+  workspace_lines="$1"
+  # Rewrite each line, resolving variables
+  while read -r line; do
+    ws_var=$(echo "$line" | awk '{print $2}')
+    mon_var=$(echo "$line" | awk '{print $4}')
+
+    ws_val="${vars[$ws_var]}"
+    mon_val="${vars[$mon_var]}"
+
+    if [[ -n "$ws_val" && -n "$mon_val" ]]; then
+      echo "workspace \"$ws_val\" output $mon_val"
+    else
+      # Leave the line untouched if the variable isn't found
+      echo "$line"
+    fi
+  done <<< "$workspace_lines"
+}
+resolve_includes() {
+  local input="$1"
+  local base_dir="$2"
+  local output=""
+
+  # Declare an associative array to track processed files
+  declare -gA processed_files
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^include[[:space:]]+(.+) ]]; then
+      include_path=$(eval echo "${BASH_REMATCH[1]}")
+      # Resolve relative paths against the base directory
+      if [[ "$include_path" != /* ]]; then
+        include_path="$base_dir/$include_path"
+      fi
+      if [[ -f "$include_path" ]]; then
+        include_path=$(realpath "$include_path")  # Normalize path
+        mtime=$(stat -c %Y "$include_path")
+        # log info "$include_path:$mtime"
+        # # write_file "$TIMESTAMP_FILE" "$TIMESTAMP_FILE_LOCK" "$include_path:$mtime"
+        # echo "$include_path:$mtime" >> "$TIMESTAMP_FILE"
+        # Check if the include_path is already in the TIMESTAMP_FILE
+        # Skip processing if the file has already been processed
+        if [[ -n "${processed_files[$include_path]}" ]]; then
+          log debug "Skipping already processed file: $include_path"
+          continue
+        fi
+
+        # Mark the file as processed
+        processed_files["$include_path"]=1
+
+        log debug "Checking if $include_path:$mtime exists in $TIMESTAMP_FILE"
+        if ! grep -q "^$include_path:$mtime$" "$TIMESTAMP_FILE"; then
+          log debug "Entry not found. Writing $include_path:$mtime to $TIMESTAMP_FILE"
+          echo "$include_path:$mtime" >> "$TIMESTAMP_FILE"
+        else
+          log debug "Entry already exists: $include_path:$mtime"
+        fi
+        included_content=$(<"$include_path")
+        included_base_dir=$(dirname "$include_path")
+        included_resolved=$(resolve_includes "$included_content" "$included_base_dir")
+        output+="$included_resolved"$'\n'
+      else
+        log warn "included file '$include_path' not found."
+      fi
+    else
+      output+="$line"$'\n'
+    fi
+  done <<< "$input"
+
+  echo "$output"
+}
+is_workspace_cache_valid() {
+  local valid_cache=true
+
+  if ! validate_workspace_cache; then
+    log warn "Workspace cache hash invalid"
+    valid_cache=false
+  fi
+
+  if [[ -f "$WS_CACHE_FILE" && -f "$TIMESTAMP_FILE" ]]; then
+    while IFS= read -r line; do
+      file=$(cut -d':' -f1 <<< "$line")
+      old_mtime=$(cut -d':' -f2 <<< "$line")
+      new_mtime=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+      if [[ "$old_mtime" != "$new_mtime" ]]; then
+        log info "Workspace config file changed: $file"
+        valid_cache=false
+        break
+      fi
+    done < "$TIMESTAMP_FILE"
+  else
+    log info "No cache or timestamp file found..."
+    valid_cache=false
+  fi
+
+  if [[ "$FORCE_CACHE_REBUILD" = true ]]; then
+    log info "FORCE_CACHE_REBUILD set, invalidating cache"
+    valid_cache=false
+  fi
+  [[ "$valid_cache" == true ]]
+}
+
+rebuild_workspace_cache() {
+  log info "Rebuilding workspace cache..."
+
+  valid_paths=()
+  [[ -f "$CONFIG_PATH" ]] && valid_paths+=("$CONFIG_PATH")
+  for path in "${POSSIBLE_PATHS[@]}"; do
+    [[ -n "$path" && -f "$path" ]] && valid_paths+=("$path")
+  done
+
+  find_workspace_config
+
+  base_dir=$(dirname "$WORKSPACE_CONFIG")
+  flattened_config=$(resolve_includes "$config_from_i3" "$base_dir")
+
+  declare -A vars
+  while read -r line; do
+    var_name=$(echo "$line" | awk '{print $2}')
+    var_value=$(echo "$line" | cut -d' ' -f3-)
+    vars["$var_name"]="$var_value"
+  done < <(echo "$flattened_config" | grep -E '^set \$[A-Za-z_][A-Za-z0-9_]* .+')
+
+  workspace_lines=$(echo "$flattened_config" | grep -E '^workspace \$[A-Za-z_][A-Za-z0-9_]* output \$[A-Za-z_][A-Za-z0-9_]*')
+
+  workspace_names=$(echo "$(parse_workspace_lines "$workspace_lines")" | awk '{print $2}' | sed 's/^"//; s/"$//')
+
+  write_file "$WS_CACHE_FILE" "$WS_CACHE_FILE_LOCK" "$workspace_names"
+
+  # build_slide_cache
+}
+
+rebuild_workspace_cache() {
+  log info "Rebuilding workspace cache..."
+
+  valid_paths=()
+  [[ -f "$CONFIG_PATH" ]] && valid_paths+=("$CONFIG_PATH")
+  for path in "${POSSIBLE_PATHS[@]}"; do
+    [[ -n "$path" && -f "$path" ]] && valid_paths+=("$path")
+  done
+
+  find_workspace_config
+
+  base_dir=$(dirname "$WORKSPACE_CONFIG")
+  flattened_config=$(resolve_includes "$config_from_i3" "$base_dir")
+
+  declare -A vars
+  while read -r line; do
+    var_name=$(echo "$line" | awk '{print $2}')
+    var_value=$(echo "$line" | cut -d' ' -f3-)
+    vars["$var_name"]="$var_value"
+  done < <(echo "$flattened_config" | grep -E '^set \$[A-Za-z_][A-Za-z0-9_]* .+')
+
+  workspace_lines=$(echo "$flattened_config" | grep -E '^workspace \$[A-Za-z_][A-Za-z0-9_]* output \$[A-Za-z_][A-Za-z0-9_]*')
+
+  workspace_names=$(echo "$(parse_workspace_lines "$workspace_lines")" | awk '{print $2}' | sed 's/^"//; s/"$//')
+
+  write_file "$WS_CACHE_FILE" "$WS_CACHE_FILE_LOCK" "$workspace_names"
+}
+load_workspace_cache() {
+  cat "$WS_CACHE_FILE"
+}
+
+get_workspaces() {
+  if ! is_workspace_cache_valid; then
+    rebuild_workspace_cache
+    build_slide_cache
+    write_file "$WORKSPACE_HASH_FILE" "$WORKSPACE_HASH_FILE_LOCK" "$(get_workspace_hash)"
+  fi
+  log debug "$WS_CACHE_FILE"
+  cat "$WS_CACHE_FILE"
+}
+
+get_menu_option() {
+  label="$2"
+  if [[ -z $MENU_TYPE ]]; then
+    if [[ -n $alt_cmd ]]; then
+      MENU_TYPE="$alt_cmd"
+      log notice "⚠️ Using fallback menu type: $MENU_TYPE"
+    else
+      log err "❌ No menu type provided, and no fallback available."
+      exit 1
+    fi
+  fi
+
+  if ! command -v ${MENU_TYPE%%_*} &>/dev/null; then
+    log err "❌ Menu command '${MENU_TYPE%%_*}' not found on system."
+    exit 1
+  fi
+  echo -e "$WORKSPACES" | $MENU_TYPE "$label"
+}
+get_selected_workspace() {
+  label="$1"
+  # Get selected workspace
+  selected_workspace=$(get_menu_option "$WORKSPACES" "$label")
+  if [[ -z "$selected_workspace" ]]; then
+    log info "No workspace selected"
+    exit 1
+  fi
+  log info "Selected workspace: $selected_workspace"
+  export SELECTED_WORKSPACE=$selected_workspace
+}
+switch_workspace() {
+
+  # Get the workspace number
+  workspace_number=$(echo "$SELECTED_WORKSPACE" | awk '{print $1}')
+
+  # Get the workspace name
+  workspace_name=$(echo "$SELECTED_WORKSPACE" | awk '{print $2}')
+
+  # Switch to the workspace
+  if [[ -z "$workspace_number" ]]; then
+    log err "No workspace number provided, instead received: $SELECTED_WORKSPACE"
+    exit 1
+  fi
+  if [[ -z "$workspace_name" ]]; then
+    label=$workspace_number
+  else
+    label="$workspace_number:\"$workspace_name\""
+  fi
+  log info "Switching to workspace: $label"
+  i3-msg workspace "$label"
+}
+move_window() {
+    # Get the focused window's ID in i3
+    focused_window_id=$(i3-msg -t get_tree | jq '.. | select(.focused? == true) | .id')
+    log info "Moving window id: $focused_window_id"
+
+    selected_window_num=$(i3-msg -t get_tree | jq --argjson id "$focused_window_id" 'recurse(.nodes[]?, .floating_nodes[]?) | select(.id == $id) | .window')
+    log info "With window num: $selected_window_num"
+
+    # Focus the selected workspace and move the focused window to it
+    i3-msg [id=$selected_window_num] move window to workspace "$SELECTED_WORKSPACE"
+}
+shift_workspace() {
+    move_window
+    switch_workspace
+}
+cleanup() {
+  [[ -f "$LOCKFILE" && "$(cat "$LOCKFILE")" == "$$" ]] && rm -f "$LOCKFILE"
+  exit
+}
+check_lockfile() {
+  local lockfile="$1"
+  if [[ -f "$lockfile" ]]; then
+    local pid=$(cat "$lockfile")
+    if kill -0 "$pid" 2>/dev/null; then
+      log error "Another instance is running with PID: $pid"
+      exit 1
+    else
+      rm -f "$lockfile"
+    fi
+  fi
+
+  lockfile="$1"
+
+if [[ -f "$lockfile" ]]; then
+  pid=$(<"$lockfile")  # Faster than cat
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "Another instance is running with PID: $pid" >&2
+    exit 1
+  else
+    rm -f "$lockfile"
+  fi
+fi
+  # Create a new lockfile
+  echo $$ > "$lockfile"
+  chmod 600 "$lockfile"
+}
+start_ipc_listener() {
+  # Only one listener should be running
+  check_lockfile "$IPC_LOCKFILE"
+
+  log info "Starting background process for workspace-switcher"
+
+  # Clean up on kill/exit
+  trap cleanup EXIT INT TERM
+
+  # Start IPC listener in background
+  i3-msg -t subscribe '[ "workspace" ]' | while read -r _; do
+    polybar_hook
+  done &
+  #polybar_hook
+  exit 0
+}
+
+polybar_hook () {
+  polybar-msg action "#$MODULE_NAME.hook.$HOOK_INDEX"
+}
+
+workspace_rehash() {
+  new_hash=$(get_workspace_hash)
+  old_hash=$(cat "$WORKSPACE_HASH_FILE" 2>/dev/null)
+
+  if [[ "$new_hash" != "$old_hash" ]]; then
+    log info "Workspace config changed, running polybar_hook..."
+    log debug "$WORKSPACE_HASH_FILE" "$WORKSPACE_HASH_FILE_LOCK" "$new_hash"
+    write_file "$WORKSPACE_HASH_FILE" "$WORKSPACE_HASH_FILE_LOCK" "$new_hash"
+    # echo "$new_hash" > "$WORKSPACE_HASH_FILE"
+
+    polybar_hook
+  else
+    log debug "No workspace config changes."
+  fi
+}
+
+is_polybar_running() {
+  pgrep -x polybar >/dev/null
+}
+main() {
+  config=""
+  ALT_CMD=""
+  positional=()
+  umask 077 # Set umask to 077 to ensure all files are created with restrictive permissions
+  mkdir -p "$WS_CACHE_DIR"
+  if [[ "$1" == "--launch" ]]; then
+      log info "Launching the workspace-switcher bar"
+      polybar_hook
+      exit 0
+  elif [[ "$1" = "--startup" ]]; then
+    log info "Starting Workspace Switcher"
+    start_ipc_listener
+    return 0
+  fi
+
+  # Parse arguments
+  for arg in "$@"; do
+    case "$arg" in
+      -h|--help)
+        echo "Usage: $0 [--config=PATH] [-rofi|-dmenu] [switch|move|list]" >&2
+        exit 0
+        ;;
+      --config=*)
+        CONFIG_PATH="${arg#*=}"
+        ;;
+      -rofi)
+        mode="menu"
+        MENU_TYPE="rofi_menu"
+        ;;
+      -dmenu)
+        mode="menu"
+        MENU_TYPE="dmenu_menu"
+        ;;
+      ws=*)
+        ws="${arg#*=}"
+        number="${ws%%|*}"
+        name="${ws#*|}"
+        export SELECTED_WORKSPACE="$number:\"$name\""
+        ;;
+      scroll=*)
+        mode="scroll"
+        direction="${arg#*=}"
+        ;;
+      slide=*)
+        mode="slide"
+        direction="${arg#*=}"
+        ;;
+      alt=*)
+        ALT_CMD="${arg#*=}"
+        ;;
+      *)
+        positional+=("$arg")
+        ;;
+    esac
+  done
+
+  command=${positional[0]}
+
+  log debug "mode: $mode; direction: $direction"
+  case "$mode" in
+    scroll)
+      if [[ "$direction" = "up" || "$direction" = "down" ]]; then
+        scroll "$direction"
+      fi
+      exit 0
+      ;;
+    slide)
+      if [[ "$direction" = "left" || "$direction" = "right" ]]; then
+        slide "$direction"
+        log info "slide $direction"
+      fi
+      exit 0
+      ;;
+  esac
+
+  # Access:
+  # $config    → path to config file
+  # $mode      → 'rofi' or 'dmenu'
+  # $alt_cmd   → alternate fallback command
+  # ${positional[0]} → optional command (e.g., "switch", "reload", etc.)
+
+  # Debug output
+  # echo "Config: $config" >&2
+  # echo "Menu: $MENU_TYPE" >&2
+  # echo "Alt: $ALT_CMD" >&2
+  # echo "Command: $command" >&2
+
+  # Possible config paths (in search order)
+  POSSIBLE_PATHS=(
+    "$CONFIG_PATH"
+    "$I3_CONFIG_PATH"
+    "$XDG_CONFIG_HOME/i3/config"
+    "$HOME/.config/i3/config"
+    "$HOME/.i3/config"
+    "/etc/i3/config"
+  )
+
+  # Get config content in memory
+  config_from_i3=$(i3-msg -t get_config)
+
+  export WORKSPACES=$(get_workspaces)
+  read -ra WORKSPACE_ARRAY <<< "$WORKSPACES"
+
+  case "$command" in
+    --startup)
+      start_ipc_listener
+      # workspace_bar
+      ;;
+    --launch)
+      echo "test"
+      #polybar_hook
+      exit 0
+      # workspace_bar
+      ;;
+    bar)
+      # log debug "Launching (or refreshing) Workspace Bar"
+      scrollable_workspace_bar
+      ;;
+    list)
+      log info "List workspaces"
+      echo "$WORKSPACES"
+      ;;
+    switch)
+      log info "Switch workspaces"
+      [[ -n "$SELECTED_WORKSPACE" ]] || get_selected_workspace "Go to workspace"
+      switch_workspace
+      ;;
+    shift)
+      log info "Shift workspaces"
+      [[ -n "$SELECTED_WORKSPACE" ]] || get_selected_workspace "Shift to workspace"
+      shift_workspace
+      ;;
+    move)
+      log info "Move Workspaces"
+      [[ -n "$SELECTED_WORKSPACE" ]] || get_selected_workspace "Move window to workspace"
+      move_window
+      ;;
+    *)
+      echo "Invalid command or no command provided" >&2
+      ;;
+  esac
+}
+main "$@" || exit 1
+exit 0
+# newest for rea
